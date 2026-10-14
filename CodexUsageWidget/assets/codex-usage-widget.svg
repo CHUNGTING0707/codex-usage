@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Codex usage widget icon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#17243a"/><stop offset="1" stop-color="#0c1321"/>
+    </linearGradient>
+    <linearGradient id="a" x1="0" x2="1"><stop stop-color="#51e0ce"/><stop offset="1" stop-color="#35bbcf"/></linearGradient>
+    <linearGradient id="b" x1="0" x2="1"><stop stop-color="#7397ff"/><stop offset="1" stop-color="#5476e8"/></linearGradient>
+  </defs>
+  <rect x="13" y="13" width="230" height="230" rx="54" fill="url(#bg)" stroke="#6385b3" stroke-width="5"/>
+  <circle cx="190" cy="66" r="11" fill="#51e0ce"/>
+  <rect x="48" y="89" width="160" height="23" rx="11.5" fill="#37455c"/>
+  <rect x="48" y="89" width="118" height="23" rx="11.5" fill="url(#a)"/>
+  <rect x="48" y="142" width="160" height="23" rx="11.5" fill="#37455c"/>
+  <rect x="48" y="142" width="61" height="23" rx="11.5" fill="url(#b)"/>
+  <path d="M48 193h106" stroke="#8fa8ca" stroke-width="10" stroke-linecap="round" opacity=".7"/>
+</svg>
