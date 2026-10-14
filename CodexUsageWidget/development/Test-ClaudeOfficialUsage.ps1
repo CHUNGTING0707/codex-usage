@@ -6,7 +6,10 @@
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$widget = Join-Path (Split-Path $PSScriptRoot -Parent) 'CodexUsageWidget.ps1'
+# Source layout keeps the widget next to development\; the release package keeps it in app\.
+$packageRoot = Split-Path $PSScriptRoot -Parent
+$widget = Join-Path $packageRoot 'CodexUsageWidget.ps1'
+if (-not (Test-Path $widget)) { $widget = Join-Path $packageRoot 'app\CodexUsageWidget.ps1' }
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($widget, [ref]$null, [ref]$null)
 $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false) |
     ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
