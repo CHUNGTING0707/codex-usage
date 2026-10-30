@@ -128,9 +128,24 @@ function Format-ResetSpan([TimeSpan]$Span) {
 # ---------------------------------------------------------------------------
 
 $script:ClaudeCredentialsPath = Join-Path $env:USERPROFILE '.claude\.credentials.json'
-$script:ClaudeOAuthClientId = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
-$script:ClaudeTokenUrls = @('https://platform.claude.com/v1/oauth/token', 'https://console.anthropic.com/v1/oauth/token')
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+# Appends one line per state change to ClaudeUsage.log next to the script (repeats of
+# the same message are skipped), so failures can be diagnosed without the tooltip.
+# Messages never include token values.
+$script:ClaudeLastLogMessage = $null
+function Write-ClaudeLog([string]$Message) {
+    # Logging must never break a refresh, so everything (including the lookups
+    # below, which fail under StrictMode when loaded outside the widget) is guarded.
+    try {
+        if ($Message -eq $script:ClaudeLastLogMessage) { return }
+        $script:ClaudeLastLogMessage = $Message
+        $path = Join-Path $script:AppDir 'ClaudeUsage.log'
+        if ((Test-Path $path) -and (Get-Item $path).Length -gt 512KB) { Remove-Item $path -Force }
+        Add-Content -Path $path -Encoding UTF8 -Value ('{0:yyyy-MM-dd HH:mm:ss}  {1}' -f [DateTime]::Now, $Message)
+    }
+    catch { }
+}
 
 function Read-ClaudeCredentials {
     if (-not (Test-Path $script:ClaudeCredentialsPath)) { throw 'Claude login not found. Run claude once to sign in.' }
@@ -140,52 +155,70 @@ function Read-ClaudeCredentials {
     return $json
 }
 
-# Exchanges the refresh token for a new access token and writes it back, so the
-# widget keeps working after the access token expires (about every 8 hours).
+# When the access token expires (about every 8 hours), let the official Claude Code
+# CLI renew it: it refreshes the login before sending a request and saves it to
+# .credentials.json. Refreshing directly from the widget is rejected with HTTP 429.
+# The request is a one-word Haiku reply, so it uses a negligible amount of usage.
 $script:ClaudeRefreshBlockedUntil = [DateTime]::MinValue
 $script:ClaudeRefreshBackoffMinutes = 15
 
+function Get-ClaudeCliPath {
+    $local = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+    if (Test-Path $local) { return $local }
+    $command = Get-Command claude -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    return $null
+}
+
 function Update-ClaudeToken($Credentials) {
-    # After a failed refresh, wait before trying again (15 min, doubling up to 4 h);
-    # retrying on every widget refresh gets the token endpoint to reply HTTP 429.
+    # After a failed renewal, wait before trying again (15 min, doubling up to 4 h).
     if ([DateTime]::Now -lt $script:ClaudeRefreshBlockedUntil) {
         throw ('Claude login expired. Next automatic retry at {0:HH:mm}; running claude once fixes it sooner.' -f $script:ClaudeRefreshBlockedUntil)
     }
-    $oauth = $Credentials.claudeAiOauth
-    $body = @{ grant_type = 'refresh_token'; refresh_token = $oauth.refreshToken; client_id = $script:ClaudeOAuthClientId } | ConvertTo-Json -Compress
-    $response = $null
-    $failures = @()
-    foreach ($url in $script:ClaudeTokenUrls) {
-        # A 429 means the refresh itself is throttled; the other URL would be too.
-        if ($failures.Count -gt 0 -and $failures[-1] -like '*HTTP 429*') { break }
-        try {
-            $response = Invoke-RestMethod -Method Post -Uri $url -Body $body -ContentType 'application/json' -TimeoutSec 15
-            if ($response -and $response.PSObject.Properties['access_token']) { break }
-            $failures += "$url -> no access_token in response"
+    $cli = Get-ClaudeCliPath
+    if (-not $cli) { throw 'Claude login expired and the claude command line tool was not found. Run claude once.' }
+
+    $detail = ''
+    try {
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $cli
+        $psi.Arguments = '-p "Reply with just: ok" --model haiku'
+        $psi.WorkingDirectory = $script:AppDir
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(90000)) { $process.Kill(); $detail = 'claude CLI timed out' }
+        else {
+            $errorText = $stderr.Result.Trim()
+            $detail = "claude CLI exit $($process.ExitCode)" + $(if ($errorText) { ': ' + ($errorText -split "`n")[0] } else { '' })
         }
-        catch {
-            $status = ''
-            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) { $status = "HTTP $([int]$_.Exception.Response.StatusCode) " }
-            $failures += "$url -> $status$($_.Exception.Message)"
-        }
-        $response = $null
     }
-    if ($null -eq $response) {
+    catch { $detail = 'claude CLI failed to start: ' + $_.Exception.Message }
+
+    # The CLI can exit non-zero (e.g. its own request was throttled) after it has
+    # already saved the renewed login, and the save can land a moment after exit,
+    # so judge success by the token expiry and re-check a few times.
+    $validAfter = [DateTimeOffset]::UtcNow.AddMinutes(2).ToUnixTimeMilliseconds()
+    $expiresAt = [long]0
+    for ($check = 0; $check -lt 5; $check++) {
+        if ($check -gt 0) { Start-Sleep -Seconds 2 }
+        $renewed = Read-ClaudeCredentials
+        if ($renewed.claudeAiOauth.PSObject.Properties['expiresAt']) { $expiresAt = [long]$renewed.claudeAiOauth.expiresAt }
+        if ($expiresAt -gt $validAfter) { break }
+    }
+    if ($expiresAt -le $validAfter) {
         $script:ClaudeRefreshBlockedUntil = [DateTime]::Now.AddMinutes($script:ClaudeRefreshBackoffMinutes)
         $script:ClaudeRefreshBackoffMinutes = [Math]::Min(240, $script:ClaudeRefreshBackoffMinutes * 2)
-        throw ('Claude login expired and refresh failed. Run claude once. [' + ($failures -join ' | ') + ']')
+        throw "Claude login expired and renewal via the claude CLI failed ($detail). Run claude once, or /login if that fails."
     }
     $script:ClaudeRefreshBackoffMinutes = 15
-
-    $oauth.accessToken = $response.access_token
-    if ($response.PSObject.Properties['refresh_token']) { $oauth.refreshToken = $response.refresh_token }
-    if ($response.PSObject.Properties['expires_in']) {
-        $oauth.expiresAt = [DateTimeOffset]::UtcNow.AddSeconds([double]$response.expires_in).ToUnixTimeMilliseconds()
-    }
-    # Claude Code (Node.js) reads this file, so write UTF-8 without a BOM, via a temp file.
-    $temp = $script:ClaudeCredentialsPath + '.widget-tmp'
-    [IO.File]::WriteAllText($temp, ($Credentials | ConvertTo-Json -Depth 10 -Compress), [Text.UTF8Encoding]::new($false))
-    Move-Item -Path $temp -Destination $script:ClaudeCredentialsPath -Force
+    Write-ClaudeLog 'Token renewed via claude CLI'
+    $Credentials.claudeAiOauth.accessToken = $renewed.claudeAiOauth.accessToken
+    $Credentials.claudeAiOauth.expiresAt = $expiresAt
 }
 
 function Get-ClaudeOfficialUsage {
@@ -246,11 +279,13 @@ $script:ClaudeFileOffsets = @{}   # log file path -> bytes already parsed
 $script:ClaudeEntries = @{}       # "messageId:requestId" -> @{ Time; Tokens }
 
 function Get-ClaudeConfig {
-    $config = @{ fiveHourTokenLimit = [long]0; weeklyTokenLimit = [long]0 }
+    # weeklyResetDayOfWeek (0 = Sunday ... 6 = Saturday) and weeklyResetHour (local time)
+    # match the weekly reset shown on Claude's usage page; -1 means a rolling 7 days.
+    $config = @{ fiveHourTokenLimit = [long]0; weeklyTokenLimit = [long]0; weeklyResetDayOfWeek = [long]-1; weeklyResetHour = [long]0 }
     $path = Join-Path $script:AppDir 'ClaudeUsageConfig.json'
     if (Test-Path $path) {
         $json = Get-Content -Path $path -Raw -Encoding UTF8 | ConvertFrom-Json
-        foreach ($name in @('fiveHourTokenLimit', 'weeklyTokenLimit')) {
+        foreach ($name in @('fiveHourTokenLimit', 'weeklyTokenLimit', 'weeklyResetDayOfWeek', 'weeklyResetHour')) {
             $property = $json.PSObject.Properties[$name]
             if ($null -ne $property -and $null -ne $property.Value) { $config[$name] = [long]$property.Value }
         }
@@ -332,17 +367,30 @@ function Update-ClaudeEntries {
     }
 }
 
+function Get-WeekStartUtc($Config) {
+    $day = [int]$Config.weeklyResetDayOfWeek
+    $hour = [int]$Config.weeklyResetHour
+    if ($day -lt 0 -or $day -gt 6 -or $hour -lt 0 -or $hour -gt 23) { return [DateTime]::UtcNow.AddDays(-7) }
+    # Most recent occurrence of the configured local reset time.
+    $nowLocal = [DateTime]::Now
+    $start = $nowLocal.Date.AddHours($hour).AddDays(-((([int]$nowLocal.DayOfWeek) - $day + 7) % 7))
+    if ($start -gt $nowLocal) { $start = $start.AddDays(-7) }
+    return $start.ToUniversalTime()
+}
+
 function Get-ClaudeUsage {
     Update-ClaudeEntries
     $now = [DateTime]::UtcNow
-    $weekStart = $now.AddDays(-7)
-    $entries = @($script:ClaudeEntries.Values | Where-Object { $_.Time -ge $weekStart } | Sort-Object { $_.Time })
+    $weekStart = Get-WeekStartUtc (Get-ClaudeConfig)
+    # All kept entries (8 days) feed the 5-hour window chain; only those since the
+    # weekly reset count toward the weekly total.
+    $entries = @($script:ClaudeEntries.Values | Sort-Object { $_.Time })
 
     $weekly = [long]0
     $blockStart = $null
     $blockTokens = [long]0
     foreach ($entry in $entries) {
-        $weekly += $entry.Tokens
+        if ($entry.Time -ge $weekStart) { $weekly += $entry.Tokens }
         # Claude's 5-hour window starts at the first message after the previous
         # window ended (rounded down to the hour), like ccusage's session blocks.
         if ($null -eq $blockStart -or $entry.Time -ge $blockStart.AddHours(5)) {
@@ -395,8 +443,12 @@ function Read-UsedPercent([string]$Prompt) {
 
 function Save-ClaudeConfig($Config) {
     $path = Join-Path $script:AppDir 'ClaudeUsageConfig.json'
-    ([ordered]@{ fiveHourTokenLimit = $Config.fiveHourTokenLimit; weeklyTokenLimit = $Config.weeklyTokenLimit } |
-        ConvertTo-Json) | Set-Content -Path $path -Encoding ASCII
+    ([ordered]@{
+        fiveHourTokenLimit   = $Config.fiveHourTokenLimit
+        weeklyTokenLimit     = $Config.weeklyTokenLimit
+        weeklyResetDayOfWeek = $Config.weeklyResetDayOfWeek
+        weeklyResetHour      = $Config.weeklyResetHour
+    } | ConvertTo-Json) | Set-Content -Path $path -Encoding ASCII
 }
 
 # Calibration: the user types the "% used" that Claude's Settings > Usage page
@@ -552,23 +604,57 @@ $refreshCodex = {
     }
 }
 
+# The usage endpoint answers HTTP 429 when polled too often, so query it at most every
+# 5 minutes, back off after a 429 (10 min doubling to 60), and in between keep showing
+# the last official numbers instead of dropping to the local estimate.
+$script:ClaudeOfficialCache = $null   # @{ FiveHour; Weekly; At }
+$script:ClaudeOfficialNextQuery = [DateTime]::MinValue
+$script:ClaudeOfficialBackoffMinutes = 10
+
+$showOfficialClaude = {
+    param($Data, [string]$Note)
+    Set-OfficialRow $claudePrimaryText $claudePrimaryBar $Data.FiveHour '5h window'
+    Set-OfficialRow $claudeSecondaryText $claudeSecondaryBar $Data.Weekly 'Weekly limit'
+    $claudeStatusText.Text = if ($null -ne $Data.FiveHour -and $null -ne $Data.FiveHour.ResetsAt) { Format-ResetSpan ($Data.FiveHour.ResetsAt - [DateTimeOffset]::Now) }
+        else { 'Reset time unavailable' }
+    $claudeStatusText.ToolTip = ('Official usage for the whole Claude account, as of {0:HH:mm}{1}' -f $Data.At, $Note)
+    # Calibration only matters for the local estimate.
+    $calibrateButton.Visibility = 'Collapsed'
+}
+
 $refreshClaude = {
     $officialError = $null
+    $cache = $script:ClaudeOfficialCache
+    if ($null -ne $cache -and [DateTime]::Now -lt $script:ClaudeOfficialNextQuery) {
+        & $showOfficialClaude $cache ''
+        return
+    }
     try {
         $official = Get-ClaudeOfficialUsage
         $fiveHour = Get-OfficialWindow $official 'five_hour'
         $weekly = Get-OfficialWindow $official 'seven_day'
         if ($null -eq $fiveHour -and $null -eq $weekly) { throw 'Claude usage response had no usage data.' }
-        Set-OfficialRow $claudePrimaryText $claudePrimaryBar $fiveHour '5h window'
-        Set-OfficialRow $claudeSecondaryText $claudeSecondaryBar $weekly 'Weekly limit'
-        $claudeStatusText.Text = if ($null -ne $fiveHour -and $null -ne $fiveHour.ResetsAt) { Format-ResetSpan ($fiveHour.ResetsAt - [DateTimeOffset]::Now) }
-            else { 'Reset time unavailable' }
-        $claudeStatusText.ToolTip = 'Official usage for the whole Claude account'
-        # Calibration only matters for the local estimate.
-        $calibrateButton.Visibility = 'Collapsed'
+        $script:ClaudeOfficialCache = @{ FiveHour = $fiveHour; Weekly = $weekly; At = [DateTime]::Now }
+        $script:ClaudeOfficialNextQuery = [DateTime]::Now.AddMinutes(5)
+        $script:ClaudeOfficialBackoffMinutes = 10
+        & $showOfficialClaude $script:ClaudeOfficialCache ''
+        Write-ClaudeLog 'Official usage OK'
         return
     }
-    catch { $officialError = $_.Exception.Message }
+    catch {
+        $officialError = $_.Exception.Message
+        Write-ClaudeLog ('Official usage FAILED: ' + $officialError)
+    }
+
+    if ($officialError -like '*(429)*') {
+        $script:ClaudeOfficialNextQuery = [DateTime]::Now.AddMinutes($script:ClaudeOfficialBackoffMinutes)
+        $script:ClaudeOfficialBackoffMinutes = [Math]::Min(60, $script:ClaudeOfficialBackoffMinutes * 2)
+        # Throttled: keep the last official numbers for up to an hour.
+        if ($null -ne $cache -and ([DateTime]::Now - $cache.At).TotalMinutes -lt 60) {
+            & $showOfficialClaude $cache ('; next query {0:HH:mm} (throttled)' -f $script:ClaudeOfficialNextQuery)
+            return
+        }
+    }
 
     $calibrateButton.Visibility = 'Visible'
     try {

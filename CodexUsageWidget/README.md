@@ -22,16 +22,16 @@
 
 如果這台電腦已用 Claude Code 命令列工具登入過（`%USERPROFILE%\.local\bin\claude.exe`，執行一次並登入即可），小工具會用這份登入資訊（`%USERPROFILE%\.claude\.credentials.json`）向 Anthropic 查詢官方用量。數字和 Claude「設定 → 用量」頁面一致，共用帳號裡所有人的用量都算在內；這種情況下「校準」按鈕會自動隱藏。
 
-- 只會查詢用量，不會傳送任何提示詞，也不消耗 Claude 額度。
-- 登入 token 大約 8 小時過期一次，小工具會自動換新 token 並寫回登入檔。如果自動換新失敗，請執行一次 `claude` 重新整理登入狀態。
-- 這個查詢方式不是 Anthropic 公開文件寫明的，之後可能會改變。查詢失敗時，小工具會自動改用下面的本機估算，狀態列會以 `Estimate -` 開頭；把滑鼠移到狀態列上可以看到失敗原因。
+- 查詢用量本身不會傳送提示詞，也不消耗 Claude 額度；只有約每 8 小時換新登入時，會送出一個極小的 Haiku 請求（見下一點）。
+- 登入 token 大約 8 小時過期一次。過期時小工具會在背景呼叫 Claude Code 命令列工具，送出一個只回「ok」的 Haiku 請求，讓它自動換新登入（會用掉極少量額度）。如果換新失敗，請執行一次 `claude`；仍失敗就在裡面輸入 `/login` 重新登入。
+- 這個查詢方式不是 Anthropic 公開文件寫明的，之後可能會改變。查詢失敗時，小工具會自動改用下面的本機估算，狀態列會以 `Estimate -` 開頭；把滑鼠移到狀態列上可以看到失敗原因，同樣的內容也會記在程式旁的 `ClaudeUsage.log`。
 
 ### 本機估算（無法查到官方用量時）
 
 本機估算的來源是這台電腦的對話紀錄 `%USERPROFILE%\.claude\projects\*.jsonl`：只讀本機檔案，不連網、不使用登入資訊，也不消耗 Claude 額度。
 
 - **5小時用量**：目前這個 5 小時區段的 token 數（從該區段第一則訊息的整點開始算），下方顯示距離重置還有多久。
-- **1週用量**：最近 7 天的 token 數。
+- **1週用量**：從 Claude 每週重置時間起算的 token 數。重置時間寫在 `ClaudeUsageConfig.json` 的 `weeklyResetDayOfWeek`（0 = 週日 … 6 = 週六）和 `weeklyResetHour`（本地時間，0–23），請照 Claude 用量頁面「每週限制」顯示的時間填；設為 -1 則改算最近 7 天。
 - 計算方式為 input + cache 寫入 + output，不含 cache 讀取；同一則回覆的重複紀錄會自動去除。
 - 只統計這台電腦上 Claude Code／Claude Desktop Code 分頁的使用量，claude.ai 網頁版或其他裝置的用量不會算進來。
 
